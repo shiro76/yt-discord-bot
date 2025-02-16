@@ -57,7 +57,7 @@ Dans le dossier racine du projet, créez un fichier `.env` contenant votre token
 Le fichier `.env` doit contenir la ligne suivante :
 
 ```env
-DISCORD_TOKEN=Votre_Token_Discord_Ici
+DISCORD_TOKEN= "Votre_Token_Discord_Ici"
 ```
 
 ### 5. **Lancer le bot**
