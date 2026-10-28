@@ -1,11 +1,10 @@
-
 # yt-discord-bot Discord
 
 yt-discord-bot est un bot Discord qui permet de jouer de la musique depuis YouTube, de gérer des playlists, et d'effectuer diverses actions liées à la musique dans un serveur Discord.
 
 ## Prérequis
 
-- Python 3.9 ou version supérieure.
+- Python 3.12 ou version supérieure.
 - Un environnement virtuel (recommandé mais non obligatoire).
 
 ## Installation
