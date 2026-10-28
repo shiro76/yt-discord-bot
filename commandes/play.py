@@ -1,112 +1,285 @@
+import asyncio
+import subprocess
+import sys
+
 import discord
 from discord.ext import commands
 import yt_dlp
-import urllib.parse
-import urllib.request
-import re
-import asyncio
+
 
 class Play(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.queues = {}
         self.voice_clients = {}
-        self.youtube_base_url = 'https://www.youtube.com/'
-        self.youtube_results_url = self.youtube_base_url + 'results?'
-        self.youtube_watch_url = self.youtube_base_url + 'watch?v='
-        #self.yt_dl_options = {"format": "bestaudio/best"}
+        self.current_track = {}
         self.yt_dl_options = {
             "format": "bestaudio/best",
             "noplaylist": True,
             "quiet": True,
-            "extractaudio": True,
-            "nocheckcertificate": True,
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }]
         }
-        self.current_track = {}
-        self.ffmpeg_options = {'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5', 'options': '-vn -filter:a "volume=0.25"'}
+
+    def extract(self, query):
+        """Récupère uniquement les infos (titre, URL de la page)."""
+        with yt_dlp.YoutubeDL(self.yt_dl_options) as ydl:
+            info = ydl.extract_info(query, download=False)
+        if "entries" in info:  # résultat de recherche
+            if not info["entries"]:
+                raise ValueError("Aucun résultat")
+            info = info["entries"][0]
+        return info
+
+    def make_source(self, url):
+        """yt-dlp télécharge et envoie le flux à FFmpeg par pipe."""
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "yt_dlp", "-f", "bestaudio",
+             "--no-playlist", "-q", "-o", "-", url],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,  # mets sys.stderr pour déboguer
+        )
+        player = discord.FFmpegOpusAudio(
+            proc.stdout,
+            pipe=True,
+            executable=r"C:\ffmpeg\bin\ffmpeg.exe",
+            options='-vn -filter:a "volume=0.25"',
+        )
+        return player, proc
+
+    def make_embed(self, item, header):
+        embed = discord.Embed(
+            title=item['title'],
+            url=item['url'],
+            description=header,
+            color=discord.Color.red(),
+        )
+        if item.get('thumbnail'):
+            embed.set_image(url=item['thumbnail'])  # set_thumbnail pour une petite image
+        if item.get('duration'):
+            m, s = divmod(int(item['duration']), 60)
+            embed.set_footer(text=f"Durée : {m}:{s:02d}")
+        return embed
+
+    async def notify(self, interaction, message=None, embed=None):
+        """Envoie dans le salon, sinon via followup, sinon affiche en console."""
+        try:
+            await interaction.channel.send(content=message, embed=embed)
+        except discord.HTTPException:
+            try:
+                await interaction.followup.send(content=message, embed=embed)
+            except discord.HTTPException:
+                print(f"Impossible d'envoyer : {message or (embed.title if embed else '')}")
 
     @discord.app_commands.command(name="play", description="joue ou ajoute a la file un son depuis Youtube")
     async def play(self, interaction: discord.Interaction, link: str = None):
         await interaction.response.defer()
-
         guild_id = interaction.guild.id
-        if guild_id not in self.queues:
-            self.queues[guild_id] = []
+        self.queues.setdefault(guild_id, [])
+
+        if not interaction.user.voice or not interaction.user.voice.channel:
+            await interaction.followup.send("Tu dois être dans un salon vocal.", ephemeral=True)
+            return
 
         voice_client = self.voice_clients.get(guild_id)
+        busy = voice_client and (voice_client.is_playing() or voice_client.is_paused())
 
         if link is None:
-            if self.queues[guild_id]:
+            if self.queues[guild_id] and not busy:
                 await self.play_from_queue(interaction, guild_id)
             else:
-                await interaction.followup.send("The queue is empty and no link was provided.", ephemeral=True)
+                await interaction.followup.send("File vide ou lecture déjà en cours.", ephemeral=True)
             return
 
-        if "www.youtube.com" not in link:
-            query_string = urllib.parse.urlencode({'search_query': link})
-            try:
-                with urllib.request.urlopen(self.youtube_results_url + query_string) as response:
-                    content = response.read().decode('utf-8')
-                search_results = re.findall(r'/watch\?v=(.{11})', content)
-                if not search_results or len(search_results[0]) != 11:
-                    await interaction.followup.send("Aucun résultat valide trouvé.", ephemeral=True)
-                    return
-                # if not search_results:
-                #     await interaction.followup.send("Auccun résultat trouvé.", ephemeral=True)
-                #     return
-                link = self.youtube_watch_url + search_results[0]
-            except Exception as e:
-                await interaction.followup.send(f"Error retrieving YouTube URL: {e}", ephemeral=True)
-                return
-
+        query = link if link.startswith(("http://", "https://")) else f"ytsearch1:{link}"
         try:
-            with yt_dlp.YoutubeDL(self.yt_dl_options) as ydl:
-                video_data = ydl.extract_info(link, download=False)
-                video_title = video_data.get('title', 'Title unavailable')
+            info = await asyncio.to_thread(self.extract, query)
         except Exception as e:
-            await interaction.followup.send("Failed to retrieve video information.", ephemeral=True)
+            print(f"Erreur yt-dlp (recherche): {e}")
+            await interaction.followup.send("Impossible de récupérer la vidéo.", ephemeral=True)
             return
 
-        queue_item = {'url': link, 'title': video_title}
-        self.queues[guild_id].append(queue_item)
-        await interaction.followup.send(f"Ajouté a la file: {video_title}", ephemeral=True)
+        item = {
+            'url': info.get("webpage_url", link),
+            'title': info.get("title", "Titre indisponible"),
+            'thumbnail': info.get("thumbnail"),
+            'duration': info.get("duration"),
+        }
+        self.queues[guild_id].append(item)
+        await interaction.followup.send(
+            embed=self.make_embed(item, "Ajouté à la file"),
+            ephemeral=True,
+        )
 
-        if not voice_client or not voice_client.is_playing():
+        if not busy:
             await self.play_from_queue(interaction, guild_id)
-        else:
-            await interaction.followup.send(f"{video_title} sera jouer bientot.", ephemeral=True)
 
     async def play_from_queue(self, interaction, guild_id):
         if not self.queues[guild_id]:
-            await interaction.followup.send("La file est vide.", ephemeral=True)
-            if guild_id in self.current_track:
-                del self.current_track[guild_id]  # Effacez le track en cours si la file est vide
-                #await self.voice_clients[guild_id].disconnect()
+            self.current_track.pop(guild_id, None)
+            await self.notify(interaction, "La file est vide.")
+            vc = self.voice_clients.pop(guild_id, None)
+            if vc and vc.is_connected():
+                await vc.disconnect()
             return
 
-        queue_item = self.queues[guild_id].pop(0)
-        self.current_track[guild_id] = queue_item # Mettre à jour le track en cours
-        title = queue_item['title']
-        link = queue_item['url']
+        vc = self.voice_clients.get(guild_id)
+        if not vc or not vc.is_connected():
+            voice = interaction.user.voice
+            if not voice or not voice.channel:
+                await self.notify(interaction, "Je ne sais pas quel salon vocal rejoindre.")
+                return
+            vc = await voice.channel.connect()
+            self.voice_clients[guild_id] = vc
 
-        voice_channel = interaction.user.voice.channel
-        if voice_channel and (not self.voice_clients.get(guild_id) or not self.voice_clients[guild_id].is_connected()):
-            self.voice_clients[guild_id] = await voice_channel.connect()
-            print("bot connecter au vocal")
-        with yt_dlp.YoutubeDL(self.yt_dl_options) as ydl:
-            video_data = ydl.extract_info(link, download=False)
-            song_url = video_data['url']
-        player = discord.FFmpegOpusAudio(song_url, **self.ffmpeg_options)
-        print("lancement de", title)
-        #self.voice_clients[guild_id].play(player, after=lambda e: self.bot.loop.create_task(self.play_from_queue(interaction, guild_id)))
-        self.voice_clients[guild_id].play(player, after=lambda e: asyncio.run_coroutine_threadsafe(self.play_from_queue(interaction, guild_id), self.bot.loop))
+        item = self.queues[guild_id].pop(0)
+        self.current_track[guild_id] = item
 
-        await interaction.followup.send(f"joue maintenant: {title}")
+        player, proc = self.make_source(item['url'])
+        # Attend le premier paquet audio avant de lancer la lecture
+        first = await asyncio.to_thread(player.read)
+        if not first:
+            proc.kill()
+            await self.notify(interaction, f"Impossible de lire {item['title']}, je passe au suivant.")
+            return await self.play_from_queue(interaction, guild_id)
+
+        def after(error):
+            if error:
+                print(f"Erreur de lecture: {error}")
+            proc.kill()
+            asyncio.run_coroutine_threadsafe(
+                self.play_from_queue(interaction, guild_id), self.bot.loop
+            )
+
+        vc.play(player, after=after)
+        await self.notify(interaction, embed=self.make_embed(item, "Joue maintenant"))
+
 
 async def setup(bot):
     await bot.add_cog(Play(bot))
+
+# import asyncio
+# import subprocess
+# import sys
+
+# import discord
+# from discord.ext import commands
+# import yt_dlp
+
+
+# class Play(commands.Cog):
+#     def __init__(self, bot):
+#         self.bot = bot
+#         self.queues = {}
+#         self.voice_clients = {}
+#         self.current_track = {}
+#         self.yt_dl_options = {
+#             "format": "bestaudio/best",
+#             "noplaylist": True,
+#             "quiet": True,
+#         }
+
+#     def extract(self, query):
+#         """Récupère uniquement les infos (titre, URL de la page)."""
+#         with yt_dlp.YoutubeDL(self.yt_dl_options) as ydl:
+#             info = ydl.extract_info(query, download=False)
+#         if "entries" in info:  # résultat de recherche
+#             if not info["entries"]:
+#                 raise ValueError("Aucun résultat")
+#             info = info["entries"][0]
+#         return info
+
+#     def make_source(self, url):
+#         """yt-dlp télécharge et envoie le flux à FFmpeg par pipe."""
+#         proc = subprocess.Popen(
+#             [sys.executable, "-m", "yt_dlp", "-f", "bestaudio",
+#              "--no-playlist", "-q", "-o", "-", url],
+#             stdout=subprocess.PIPE,
+#             stderr=subprocess.DEVNULL,  # mets sys.stderr pour déboguer
+#         )
+#         player = discord.FFmpegOpusAudio(
+#             proc.stdout,
+#             pipe=True,
+#             executable=r"C:\ffmpeg\bin\ffmpeg.exe",
+#             options='-vn -filter:a "volume=0.25"',
+#         )
+#         return player, proc
+
+#     @discord.app_commands.command(name="play", description="joue ou ajoute a la file un son depuis Youtube")
+#     async def play(self, interaction: discord.Interaction, link: str = None):
+#         await interaction.response.defer()
+#         guild_id = interaction.guild.id
+#         self.queues.setdefault(guild_id, [])
+
+#         if not interaction.user.voice or not interaction.user.voice.channel:
+#             await interaction.followup.send("Tu dois être dans un salon vocal.", ephemeral=True)
+#             return
+
+#         voice_client = self.voice_clients.get(guild_id)
+#         busy = voice_client and (voice_client.is_playing() or voice_client.is_paused())
+
+#         if link is None:
+#             if self.queues[guild_id] and not busy:
+#                 await self.play_from_queue(interaction, guild_id)
+#             else:
+#                 await interaction.followup.send("File vide ou lecture déjà en cours.", ephemeral=True)
+#             return
+
+#         query = link if link.startswith(("http://", "https://")) else f"ytsearch1:{link}"
+#         try:
+#             info = await asyncio.to_thread(self.extract, query)
+#         except Exception as e:
+#             print(f"Erreur yt-dlp (recherche): {e}")
+#             await interaction.followup.send("Impossible de récupérer la vidéo.", ephemeral=True)
+#             return
+
+#         title = info.get("title", "Titre indisponible")
+#         self.queues[guild_id].append({'url': info.get("webpage_url", link), 'title': title})
+#         await interaction.followup.send(f"Ajouté à la file : {title}", ephemeral=True)
+
+#         if not busy:
+#             await self.play_from_queue(interaction, guild_id)
+
+#     async def play_from_queue(self, interaction, guild_id):
+#         channel = interaction.channel
+
+#         if not self.queues[guild_id]:
+#             self.current_track.pop(guild_id, None)
+#             await channel.send("La file est vide.")
+#             vc = self.voice_clients.pop(guild_id, None)
+#             if vc and vc.is_connected():
+#                 await vc.disconnect()
+#             return
+
+#         vc = self.voice_clients.get(guild_id)
+#         if not vc or not vc.is_connected():
+#             voice = interaction.user.voice
+#             if not voice or not voice.channel:
+#                 await channel.send("Je ne sais pas quel salon vocal rejoindre.")
+#                 return
+#             vc = await voice.channel.connect()
+#             self.voice_clients[guild_id] = vc
+
+#         item = self.queues[guild_id].pop(0)
+#         self.current_track[guild_id] = item
+
+#         player, proc = self.make_source(item['url'])
+#         # Attend le premier paquet audio avant de lancer la lecture
+#         first = await asyncio.to_thread(player.read)
+#         if not first:
+#             proc.kill()
+#             await channel.send(f"Impossible de lire {item['title']}, je passe au suivant.")
+#             return await self.play_from_queue(interaction, guild_id)
+
+#         def after(error):
+#             if error:
+#                 print(f"Erreur de lecture: {error}")
+#             proc.kill()
+#             asyncio.run_coroutine_threadsafe(
+#                 self.play_from_queue(interaction, guild_id), self.bot.loop
+#             )
+
+#         vc.play(player, after=after)
+#         await channel.send(f"Joue maintenant : {item['title']}")
+
+
+# async def setup(bot):
+#     await bot.add_cog(Play(bot))
